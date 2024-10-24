@@ -127,7 +127,10 @@ func (s *Server) NewSequence(prompt string, images []ImageData, params NewSequen
 
 	var sc *llama.SamplingContext
 	if params.samplingParams != nil {
-		sc = llama.NewSamplingContext(s.model, *params.samplingParams)
+		sc, err = llama.NewSamplingContext(s.model, *params.samplingParams)
+		if err != nil {
+			return nil, fmt.Errorf("failed to process inputs: %w", err)
+		}
 		for _, input := range inputs {
 			if input.embed == nil {
 				sc.Accept(input.token, false)

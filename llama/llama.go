@@ -63,7 +63,6 @@ package llama
 #include "ggml.h"
 #include "llava.h"
 #include "mllama.h"
-#include "sampling_ext.h"
 
 bool llamaProgressCallback(float progress, void *user_data);
 */
@@ -73,6 +72,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"runtime/cgo"
 	"strings"
@@ -532,11 +532,6 @@ func MllamaSetCrossAttn(llamaContext *Context, clipContext *ClipContext, embed [
 }
 
 // sampling
-// TODO: this is a temporary wrapper to allow calling C++ code from CGo
-type SamplingContext struct {
-	c *C.struct_gpt_sampler
-}
-
 type SamplingParams struct {
 	TopK           int
 	TopP           float32
@@ -556,42 +551,116 @@ type SamplingParams struct {
 	Grammar        string
 }
 
-func NewSamplingContext(model *Model, params SamplingParams) *SamplingContext {
-	var cparams C.struct_gpt_sampler_cparams
-	cparams.top_k = C.int32_t(params.TopK)
-	cparams.top_p = C.float(params.TopP)
-	cparams.min_p = C.float(params.MinP)
-	cparams.tfs_z = C.float(params.TfsZ)
-	cparams.typical_p = C.float(params.TypicalP)
-	cparams.temp = C.float(params.Temp)
-	cparams.penalty_last_n = C.int32_t(params.RepeatLastN)
-	cparams.penalty_repeat = C.float(params.PenaltyRepeat)
-	cparams.penalty_freq = C.float(params.PenaltyFreq)
-	cparams.penalty_present = C.float(params.PenaltyFreq)
-	cparams.mirostat = C.int32_t(params.Mirostat)
-	cparams.mirostat_tau = C.float(params.MirostatTau)
-	cparams.mirostat_eta = C.float(params.MirostatEta)
-	cparams.penalize_nl = C.bool(params.PenalizeNl)
-	cparams.seed = C.uint32_t(params.Seed)
+type SamplingContext struct {
+	chain   *C.struct_llama_sampler
+	grammar *C.struct_llama_sampler
+}
+
+func NewSamplingContext(model *Model, params SamplingParams) (*SamplingContext, error) {
+	var s SamplingContext
+	runtime.SetFinalizer(&s, func(s *SamplingContext) { s.free() })
+
+	sparams := C.llama_sampler_chain_default_params()
+	s.chain = C.llama_sampler_chain_init(sparams)
 
 	grammar := C.CString(params.Grammar)
 	defer C.free(unsafe.Pointer(grammar))
+	root := C.CString("root")
+	defer C.free(unsafe.Pointer(root))
+	s.grammar = C.llama_sampler_init_grammar(model.c, grammar, root)
 
-	cparams.grammar = grammar
-	context := &SamplingContext{c: C.gpt_sampler_cinit(model.c, &cparams)}
-	runtime.SetFinalizer(context, func(s *SamplingContext) { C.gpt_sampler_cfree(s.c) })
+	C.llama_sampler_chain_add(s.chain,
+		C.llama_sampler_init_penalties(
+			C.llama_n_vocab(model.c),
+			C.llama_token_eos(model.c),
+			C.llama_token_nl(model.c),
+			C.int32_t(params.RepeatLastN),
+			C.float(params.PenaltyRepeat),
+			C.float(params.PenaltyFreq),
+			C.float(params.PenaltyPresent),
+			C.bool(params.PenalizeNl),
+			false))
 
-	return context
-}
+	if params.Temp > 0 {
+		switch params.Mirostat {
+		case 0:
+			C.llama_sampler_chain_add(s.chain, C.llama_sampler_init_top_k(C.int32_t(params.TopK)))
+			C.llama_sampler_chain_add(s.chain, C.llama_sampler_init_tail_free(C.float(params.TfsZ), 0))
+			C.llama_sampler_chain_add(s.chain, C.llama_sampler_init_typical(C.float(params.TypicalP), 0))
+			C.llama_sampler_chain_add(s.chain, C.llama_sampler_init_top_p(C.float(params.TopP), 0))
+			C.llama_sampler_chain_add(s.chain, C.llama_sampler_init_min_p(C.float(params.MinP), 0))
+			C.llama_sampler_chain_add(s.chain, C.llama_sampler_init_temp(C.float(params.Temp)))
 
-func (s *SamplingContext) Reset() {
-	C.gpt_sampler_creset(s.c)
+			C.llama_sampler_chain_add(s.chain, C.llama_sampler_init_softmax())
+			C.llama_sampler_chain_add(s.chain, C.llama_sampler_init_dist(C.uint32_t(params.Seed)))
+		case 1:
+			C.llama_sampler_chain_add(s.chain, C.llama_sampler_init_temp(C.float(params.Temp)))
+			C.llama_sampler_chain_add(s.chain, C.llama_sampler_init_mirostat(C.llama_n_vocab(model.c),
+				C.uint32_t(params.Seed), C.float(params.MirostatTau), C.float(params.MirostatEta), 100))
+		case 2:
+			C.llama_sampler_chain_add(s.chain, C.llama_sampler_init_temp(C.float(params.Temp)))
+			C.llama_sampler_chain_add(s.chain, C.llama_sampler_init_mirostat_v2(C.uint32_t(params.Seed),
+				C.float(params.MirostatTau), C.float(params.MirostatEta)))
+		default:
+			return nil, fmt.Errorf("unknown mirostat version: %v", params.Mirostat)
+		}
+	} else {
+		C.llama_sampler_chain_add(s.chain, C.llama_sampler_init_greedy())
+	}
+
+	return &s, nil
 }
 
 func (s *SamplingContext) Sample(llamaContext *Context, idx int) int {
-	return int(C.gpt_sampler_csample(s.c, llamaContext.c, C.int(idx)))
+	logits := llamaContext.GetLogitsIth(idx)
+	numVocab := llamaContext.Model().NumVocab()
+
+	tokenData := make([]C.llama_token_data, numVocab)
+	var tokenDataPin runtime.Pinner
+	tokenDataPin.Pin(&tokenData[0])
+	defer tokenDataPin.Unpin()
+
+	for i := range tokenData {
+		tokenData[i] = C.llama_token_data{id: C.llama_token(i), logit: C.float(logits[i])}
+	}
+	tokenDataArray := C.llama_token_data_array{data: &tokenData[0], size: C.size_t(len(tokenData)), selected: -1}
+
+	C.llama_sampler_apply(s.chain, &tokenDataArray)
+
+	id := tokenData[tokenDataArray.selected].id
+
+	// Check if the selected token is allowed by the grammar
+	// If it is allowed then return it, otherwise evaluate the grammar on all
+	// tokens and resample (slow)
+	tokenData[0] = C.llama_token_data{id: id, logit: 1}
+	tokenDataArray = C.llama_token_data_array{data: &tokenData[0], size: 1, selected: -1}
+
+	C.llama_sampler_apply(s.grammar, &tokenDataArray)
+	if !math.IsInf(float64(tokenData[0].logit), -1) {
+		return int(id)
+	}
+
+	for i := range tokenData {
+		tokenData[i] = C.llama_token_data{id: C.llama_token(i), logit: C.float(logits[i])}
+	}
+	tokenDataArray = C.llama_token_data_array{data: &tokenData[0], size: C.size_t(len(tokenData)), selected: -1}
+
+	C.llama_sampler_apply(s.grammar, &tokenDataArray)
+	C.llama_sampler_apply(s.chain, &tokenDataArray)
+
+	return int(tokenData[tokenDataArray.selected].id)
 }
 
 func (s *SamplingContext) Accept(id int, applyGrammar bool) {
-	C.gpt_sampler_caccept(s.c, C.llama_token(id), C.bool(applyGrammar))
+	if applyGrammar {
+		C.llama_sampler_accept(s.grammar, C.llama_token(id))
+	}
+	C.llama_sampler_accept(s.chain, C.llama_token(id))
+}
+
+func (s *SamplingContext) free() {
+	if s != nil {
+		C.llama_sampler_free(s.grammar)
+		C.llama_sampler_free(s.chain)
+	}
 }
