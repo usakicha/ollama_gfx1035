@@ -18,7 +18,7 @@ import (
 const (
 
 	// TODO  We're lookinng for this exact name to detect iGPUs since hipGetDeviceProperties never reports integrated==true
-	iGPUName = "AMD Radeon(TM) Graphics"
+	iGPUName = "AMD 2024 Graphics"
 )
 
 var (
