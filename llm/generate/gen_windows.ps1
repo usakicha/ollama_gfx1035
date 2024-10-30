@@ -10,6 +10,7 @@ function amdGPUs {
     # https://rocm.docs.amd.com/projects/install-on-windows/en/latest/reference/system-requirements.html#windows-supported-gpus
     $GPU_LIST = @(
         "gfx1030"
+        "gfx1035"
         "gfx1100"
         "gfx1101"
         "gfx1102"
